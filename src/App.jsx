@@ -206,6 +206,16 @@ function LldpPanel({ lldp }) {
   const moduleInstalled = Boolean(lldp?.psDiscoveryProtocol?.installed);
   const elevated = Boolean(lldp?.psDiscoveryProtocol?.elevated);
 
+  useEffect(() => {
+    if (!capture?.status || capture.status === "running") return;
+    setCapturing(false);
+    if (capture.status === "complete") {
+      setActionStatus(capture.neighbors?.length ? "LLDP neighbor captured." : "LLDP capture completed with no neighbor details.");
+      return;
+    }
+    setActionStatus(capture.message || capture.error || "LLDP capture finished.");
+  }, [capture?.status, capture?.capturedAt, capture?.message, capture?.error, capture?.neighbors?.length]);
+
   async function installAgent() {
     setInstalling(true);
     setActionStatus("Installing PSDiscoveryProtocol...");

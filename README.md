@@ -53,6 +53,8 @@ Double-click one of the launchers:
 
 - `Launch Network Diagnostic.cmd`
 - `Launch Network Diagnostic Elevated.cmd`
+- `Launch Network Diagnostic.ps1`
+- `Launch Network Diagnostic Elevated.ps1`
 
 Use the elevated launcher when you want LLDP capture available immediately.
 
@@ -64,6 +66,12 @@ http://localhost:4317
 
 ## CLI Usage
 
+If `npm` is not visible in your current PowerShell session, prepend the standard Node.js install folder before running npm:
+
+```powershell
+$env:PATH = "C:\Program Files\nodejs;$env:PATH"
+```
+
 Install dependencies:
 
 ```powershell
@@ -74,6 +82,12 @@ Run the app:
 
 ```powershell
 npm run dev
+```
+
+Or run with the explicit npm path:
+
+```powershell
+& "C:\Program Files\nodejs\npm.cmd" run dev
 ```
 
 Build the frontend:

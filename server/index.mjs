@@ -414,14 +414,14 @@ $data | ConvertTo-Json -Depth 8 -Compress
       source: "PSDiscoveryProtocol",
       capturedAt: new Date().toISOString(),
       neighbors: rows.map((row) => ({
-        localInterface: row.Computer || null,
-        systemName: row.Device || null,
-        chassisId: row.SourceAddress || null,
-        portId: row.Port || null,
-        portDescription: row.Description || null,
-        model: row.Model || null,
-        ipAddress: row.IPAddress || null,
-        vlan: row.VLAN || null,
+        localInterface: firstTextValue(row.Computer, row.Connection, row.Interface),
+        systemName: firstTextValue(row.Device, row.SystemName),
+        chassisId: firstTextValue(row.ChassisId, row.SourceAddress),
+        portId: firstTextValue(row.Port, row.PortId),
+        portDescription: firstTextValue(row.PortDescription, row.Description),
+        model: firstTextValue(row.Model, row.SystemDescription),
+        ipAddress: firstTextValue(row.IPAddress, row.ManagementAddress),
+        vlan: firstTextValue(row.VLAN),
       })),
       raw: rows,
     };
@@ -612,6 +612,35 @@ function errorMessage(error) {
   if (error.cause?.message) return error.cause.message;
   if (error.code) return error.code;
   return String(error);
+}
+
+function firstTextValue(...values) {
+  for (const value of values) {
+    if (value === null || value === undefined) continue;
+    if (Array.isArray(value)) {
+      const nested = firstTextValue(...value);
+      if (nested) return nested;
+      continue;
+    }
+    if (typeof value === "string") {
+      const trimmed = value.trim();
+      if (trimmed) return trimmed;
+      continue;
+    }
+    if (typeof value === "number" || typeof value === "boolean") return String(value);
+    if (typeof value === "object") {
+      const objectValue = firstTextValue(
+        value.IPAddressToString,
+        value.ToString,
+        value.Address,
+        value.value,
+        value.Value,
+        value.Name,
+      );
+      if (objectValue) return objectValue;
+    }
+  }
+  return null;
 }
 
 function httpPostBytes(url, bytes, timeoutMs = 15000) {
