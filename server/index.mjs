@@ -1,11 +1,14 @@
 import http from "node:http";
 import https from "node:https";
+import net from "node:net";
+import dns from "node:dns/promises";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { execFile } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
+import { Worker } from "node:worker_threads";
 
 const execFileAsync = promisify(execFile);
 const ROOT_DIR = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -54,8 +57,42 @@ let lastSpeedtest = {
 let lldpInstallRunning = false;
 let lldpCaptureRunning = false;
 let lastLldpCapture = null;
+let ipScanRunning = false;
+let ipScanQueued = false;
+let ipScanState = {
+  status: "idle",
+  startedAt: null,
+  completedAt: null,
+  subnet: null,
+  range: null,
+  scannedHosts: 0,
+  totalHosts: 0,
+  devices: [],
+  error: null,
+  message: "Run a scan to discover devices on the local network.",
+};
 
 const powershell = process.platform === "win32" ? "powershell.exe" : "pwsh";
+const IP_SCAN_PORTS = [21, 22, 23, 25, 53, 80, 135, 139, 443, 445, 554, 3389, 5357, 8000, 8080, 8443, 9100];
+const PORT_LABELS = {
+  21: "FTP",
+  22: "SSH",
+  23: "Telnet",
+  25: "SMTP",
+  53: "DNS",
+  80: "HTTP",
+  135: "RPC",
+  139: "NetBIOS",
+  443: "HTTPS",
+  445: "SMB",
+  554: "RTSP",
+  3389: "RDP",
+  5357: "WSDAPI",
+  8000: "HTTP alt",
+  8080: "HTTP alt",
+  8443: "HTTPS alt",
+  9100: "Printer",
+};
 
 function sendJson(res, status, body) {
   const payload = JSON.stringify(body);
@@ -354,6 +391,424 @@ function prefixToSubnetMask(prefixLength) {
     return remaining === 0 ? 0 : 256 - 2 ** (8 - remaining);
   });
   return mask.join(".");
+}
+
+function subnetMaskToPrefix(subnetMask) {
+  const mask = ipToInt(subnetMask);
+  if (mask === null) return null;
+  const bits = mask.toString(2).padStart(32, "0");
+  if (!/^1*0*$/.test(bits)) return null;
+  return bits.indexOf("0") === -1 ? 32 : bits.indexOf("0");
+}
+
+function ipToInt(ipAddress) {
+  const parts = String(ipAddress || "").split(".").map(Number);
+  if (parts.length !== 4 || parts.some((part) => !Number.isInteger(part) || part < 0 || part > 255)) return null;
+  return parts.reduce((value, part) => ((value << 8) | part) >>> 0, 0);
+}
+
+function intToIp(value) {
+  return [24, 16, 8, 0].map((shift) => (value >>> shift) & 255).join(".");
+}
+
+function subnetHosts(ipAddress, prefixLength) {
+  const ip = ipToInt(ipAddress);
+  const prefix = Number(prefixLength);
+  if (ip === null || !Number.isInteger(prefix) || prefix < 1 || prefix > 30) return null;
+
+  const scanPrefix = Math.max(prefix, 24);
+  const mask = (0xffffffff << (32 - scanPrefix)) >>> 0;
+  const network = (ip & mask) >>> 0;
+  const broadcast = (network | (~mask >>> 0)) >>> 0;
+  const hosts = [];
+
+  for (let value = network + 1; value < broadcast; value += 1) {
+    hosts.push(intToIp(value));
+  }
+
+  return {
+    hosts,
+    subnet: `${intToIp(network)}/${scanPrefix}`,
+    range: `${intToIp(network + 1)} - ${intToIp(broadcast - 1)}`,
+    capped: scanPrefix !== prefix,
+  };
+}
+
+function getActiveIpv4Network() {
+  const interfaces = os.networkInterfaces();
+  const candidates = Object.entries(interfaces).flatMap(([name, entries]) =>
+    (entries || [])
+      .filter((entry) => entry.family === "IPv4" && !entry.internal && entry.address && entry.netmask)
+      .map((entry) => ({ name, ...entry })),
+  );
+  const preferred =
+    candidates.find((entry) => /ethernet|usb|gbe|lan|realtek|intel|2\.5|5g|10g/i.test(`${entry.name} ${entry.mac || ""}`)) ||
+    candidates[0] ||
+    null;
+
+  if (!preferred) {
+    const cached = diagnosticsCache?.network;
+    return cached
+      ? {
+          ipAddress: cached.ipAddress,
+          prefixLength: cached.prefixLength ?? subnetMaskToPrefix(cached.subnetMask),
+          subnetMask: cached.subnetMask,
+          gateway: cached.gateway,
+          macAddress: diagnosticsCache?.adapter?.macAddress || null,
+        }
+      : null;
+  }
+
+  return {
+    ipAddress: preferred.address,
+    prefixLength: subnetMaskToPrefix(preferred.netmask),
+    subnetMask: preferred.netmask,
+    gateway: diagnosticsCache?.network?.gateway || null,
+    macAddress: preferred.mac && preferred.mac !== "00:00:00:00:00:00" ? preferred.mac.toUpperCase().replace(/:/g, "-") : null,
+  };
+}
+
+async function mapLimit(items, limit, worker) {
+  const results = new Array(items.length);
+  let nextIndex = 0;
+  const workers = Array.from({ length: Math.min(limit, items.length) }, async () => {
+    while (nextIndex < items.length) {
+      const index = nextIndex;
+      nextIndex += 1;
+      results[index] = await worker(items[index], index);
+    }
+  });
+  await Promise.all(workers);
+  return results;
+}
+
+async function pingHost(ipAddress) {
+  if (process.platform === "win32") {
+    try {
+      await execFileAsync("ping.exe", ["-n", "1", "-w", "350", ipAddress], { timeout: 1200, maxBuffer: 1024 * 64 });
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  try {
+    await execFileAsync("ping", ["-c", "1", "-W", "1", ipAddress], { timeout: 1500, maxBuffer: 1024 * 64 });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function readArpTable() {
+  if (process.platform !== "win32") return new Map();
+
+  try {
+    const { stdout } = await execFileAsync("arp.exe", ["-a"], { timeout: 5000, maxBuffer: 1024 * 1024 });
+    const entries = new Map();
+    for (const match of stdout.matchAll(/(\d+\.\d+\.\d+\.\d+)\s+([0-9a-f-]{17})\s+(\w+)/gi)) {
+      entries.set(match[1], { macAddress: match[2].toUpperCase(), type: match[3] });
+    }
+    return entries;
+  } catch {
+    return new Map();
+  }
+}
+
+async function resolveHostname(ipAddress) {
+  try {
+    const names = await dns.reverse(ipAddress);
+    if (names.length) return names[0].replace(/\.$/, "");
+  } catch {
+    // Fall through to NetBIOS below.
+  }
+
+  if (process.platform !== "win32") return null;
+
+  try {
+    const { stdout } = await execFileAsync("nbtstat.exe", ["-A", ipAddress], { timeout: 1800, maxBuffer: 1024 * 64 });
+    const match = stdout.match(/^\s*([^\s<][^<]{0,14}?)\s+<00>\s+UNIQUE/im);
+    return match?.[1]?.trim() || null;
+  } catch {
+    return null;
+  }
+}
+
+function checkTcpPort(ipAddress, port, timeoutMs = 260) {
+  return new Promise((resolve) => {
+    const socket = new net.Socket();
+    let settled = false;
+    const finish = (open) => {
+      if (settled) return;
+      settled = true;
+      socket.destroy();
+      resolve(open);
+    };
+
+    socket.setTimeout(timeoutMs);
+    socket.once("connect", () => finish(true));
+    socket.once("timeout", () => finish(false));
+    socket.once("error", () => finish(false));
+    socket.connect(port, ipAddress);
+  });
+}
+
+async function scanOpenPorts(ipAddress) {
+  const checks = await mapLimit(IP_SCAN_PORTS, 4, async (port) => {
+    const open = await checkTcpPort(ipAddress, port);
+    return open ? { port, service: PORT_LABELS[port] || "TCP" } : null;
+  });
+  return checks.filter(Boolean);
+}
+
+function runIpScanWorker({ hosts, network }) {
+  const workerScript = `
+const { parentPort, workerData } = require("node:worker_threads");
+const net = require("node:net");
+const dns = require("node:dns").promises;
+const { execFile } = require("node:child_process");
+const { promisify } = require("node:util");
+const execFileAsync = promisify(execFile);
+
+function ipToInt(ipAddress) {
+  return String(ipAddress).split(".").map(Number).reduce((value, part) => ((value << 8) | part) >>> 0, 0);
+}
+
+async function mapLimit(items, limit, worker) {
+  const results = new Array(items.length);
+  let nextIndex = 0;
+  const workers = Array.from({ length: Math.min(limit, items.length) }, async () => {
+    while (nextIndex < items.length) {
+      const index = nextIndex;
+      nextIndex += 1;
+      results[index] = await worker(items[index], index);
+    }
+  });
+  await Promise.all(workers);
+  return results;
+}
+
+function checkTcpPort(ipAddress, port, timeoutMs = 260) {
+  return new Promise((resolve) => {
+    const socket = new net.Socket();
+    let settled = false;
+    const finish = (open) => {
+      if (settled) return;
+      settled = true;
+      socket.destroy();
+      resolve(open);
+    };
+    socket.setTimeout(timeoutMs);
+    socket.once("connect", () => finish(true));
+    socket.once("timeout", () => finish(false));
+    socket.once("error", () => finish(false));
+    socket.connect(port, ipAddress);
+  });
+}
+
+async function scanOpenPorts(ipAddress) {
+  const checks = await mapLimit(workerData.ports, 6, async (port) => {
+    const open = await checkTcpPort(ipAddress, port);
+    return open ? { port, service: workerData.labels[String(port)] || "TCP" } : null;
+  });
+  return checks.filter(Boolean);
+}
+
+async function readArpTable() {
+  if (workerData.platform !== "win32") return new Map();
+  try {
+    const { stdout } = await execFileAsync("arp.exe", ["-a"], { timeout: 5000, maxBuffer: 1024 * 1024 });
+    const entries = new Map();
+    for (const match of stdout.matchAll(/(\\d+\\.\\d+\\.\\d+\\.\\d+)\\s+([0-9a-f-]{17})\\s+(\\w+)/gi)) {
+      entries.set(match[1], { macAddress: match[2].toUpperCase(), type: match[3] });
+    }
+    return entries;
+  } catch {
+    return new Map();
+  }
+}
+
+async function resolveHostname(ipAddress) {
+  try {
+    const names = await dns.reverse(ipAddress);
+    if (names.length) return names[0].replace(/\\.$/, "");
+  } catch {}
+  if (workerData.platform !== "win32") return null;
+  try {
+    const { stdout } = await execFileAsync("nbtstat.exe", ["-A", ipAddress], { timeout: 1800, maxBuffer: 1024 * 64 });
+    const match = stdout.match(/^\\s*([^\\s<][^<]{0,14}?)\\s+<00>\\s+UNIQUE/im);
+    return match?.[1]?.trim() || null;
+  } catch {
+    return null;
+  }
+}
+
+(async () => {
+  const alive = new Set();
+  const portsByHost = new Map();
+  let scannedHosts = 0;
+  await mapLimit(workerData.hosts, 32, async (host) => {
+    const openPorts = await scanOpenPorts(host);
+    portsByHost.set(host, openPorts);
+    if (openPorts.length) alive.add(host);
+    scannedHosts += 1;
+    parentPort.postMessage({ type: "progress", scannedHosts });
+  });
+
+  const arpTable = await readArpTable();
+  const subnetMembers = new Set(workerData.hosts);
+  for (const ip of arpTable.keys()) {
+    if (subnetMembers.has(ip)) alive.add(ip);
+  }
+  if (workerData.network.ipAddress) alive.add(workerData.network.ipAddress);
+  if (workerData.network.gateway) alive.add(workerData.network.gateway);
+
+  const devices = await mapLimit(Array.from(alive).sort((a, b) => ipToInt(a) - ipToInt(b)), 16, async (ip) => {
+    const [hostname, openPorts] = await Promise.all([
+      resolveHostname(ip),
+      portsByHost.has(ip) ? portsByHost.get(ip) : scanOpenPorts(ip),
+    ]);
+    const arp = arpTable.get(ip);
+    return {
+      ipAddress: ip,
+      hostname,
+      macAddress: arp?.macAddress || (ip === workerData.network.ipAddress ? workerData.network.macAddress : null),
+      openPorts,
+      isLocalHost: ip === workerData.network.ipAddress,
+      isGateway: ip === workerData.network.gateway,
+    };
+  });
+
+  parentPort.postMessage({ type: "complete", devices });
+})().catch((error) => {
+  parentPort.postMessage({ type: "error", error: error?.message || String(error) });
+});
+`;
+
+  return new Promise((resolve, reject) => {
+    const worker = new Worker(workerScript, {
+      eval: true,
+      workerData: {
+        hosts,
+        network,
+        ports: IP_SCAN_PORTS,
+        labels: PORT_LABELS,
+        platform: process.platform,
+      },
+    });
+
+    worker.on("message", (message) => {
+      if (message.type === "progress") {
+        ipScanState = { ...ipScanState, scannedHosts: message.scannedHosts };
+      }
+      if (message.type === "complete") {
+        resolve(message.devices);
+      }
+      if (message.type === "error") {
+        reject(new Error(message.error));
+      }
+    });
+    worker.on("error", reject);
+    worker.on("exit", (code) => {
+      if (code !== 0) reject(new Error(`IP scan worker stopped with exit code ${code}.`));
+    });
+  });
+}
+
+async function startIpScan() {
+  if (ipScanRunning) return ipScanState;
+  ipScanQueued = false;
+  ipScanRunning = true;
+
+  ipScanState = {
+    status: "running",
+    startedAt: new Date().toISOString(),
+    completedAt: null,
+    subnet: null,
+    range: null,
+    scannedHosts: 0,
+    totalHosts: 0,
+    devices: [],
+    error: null,
+    message: "Scanning local subnet...",
+  };
+
+  try {
+    const network = getActiveIpv4Network();
+    const ipAddress = network?.ipAddress;
+    const prefixLength = network?.prefixLength ?? subnetMaskToPrefix(network?.subnetMask);
+    const subnet = subnetHosts(ipAddress, prefixLength);
+
+    if (!subnet?.hosts?.length) {
+      throw new Error("No active IPv4 subnet is available to scan.");
+    }
+
+    ipScanState = {
+      ...ipScanState,
+      subnet: subnet.subnet,
+      range: subnet.range,
+      totalHosts: subnet.hosts.length,
+      message: subnet.capped
+        ? `Scanning ${subnet.subnet}. Larger subnet was capped to the local /24 for responsiveness.`
+        : `Scanning ${subnet.subnet}.`,
+    };
+
+    const devices = await runIpScanWorker({ hosts: subnet.hosts, network });
+
+    ipScanState = {
+      ...ipScanState,
+      status: "complete",
+      completedAt: new Date().toISOString(),
+      devices,
+      message: devices.length ? `Found ${devices.length} device${devices.length === 1 ? "" : "s"} on ${subnet.subnet}.` : `No devices found on ${subnet.subnet}.`,
+    };
+  } catch (error) {
+    ipScanState = {
+      ...ipScanState,
+      status: "error",
+      completedAt: new Date().toISOString(),
+      error: errorMessage(error),
+      message: "IP scan failed.",
+    };
+  } finally {
+    ipScanRunning = false;
+    ipScanQueued = false;
+  }
+
+  return ipScanState;
+}
+
+function queueIpScan() {
+  if (ipScanRunning || ipScanQueued) return ipScanState;
+  ipScanQueued = true;
+  ipScanState = {
+    status: "running",
+    startedAt: new Date().toISOString(),
+    completedAt: null,
+    subnet: null,
+    range: null,
+    scannedHosts: 0,
+    totalHosts: 0,
+    devices: [],
+    error: null,
+    message: "Starting local subnet scan...",
+  };
+
+  setImmediate(() => {
+    startIpScan().catch((error) => {
+      ipScanRunning = false;
+      ipScanQueued = false;
+      ipScanState = {
+        ...ipScanState,
+        status: "error",
+        completedAt: new Date().toISOString(),
+        error: errorMessage(error),
+        message: "IP scan failed.",
+      };
+    });
+  });
+
+  return ipScanState;
 }
 
 async function getLldpInfo(adapterName) {
@@ -1133,6 +1588,14 @@ const server = http.createServer(async (req, res) => {
     if (url.pathname === "/api/lldp/capture" && req.method === "POST") {
       captureLldpNeighbor();
       sendJson(res, 202, { status: "running", message: "Listening for LLDP frames for up to 35 seconds." });
+      return;
+    }
+    if (url.pathname === "/api/ip-scan" && req.method === "GET") {
+      sendJson(res, 200, ipScanState);
+      return;
+    }
+    if (url.pathname === "/api/ip-scan/start" && req.method === "POST") {
+      sendJson(res, 202, queueIpScan());
       return;
     }
     if (url.pathname === "/api/admin/restart-elevated" && req.method === "POST") {

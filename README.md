@@ -19,6 +19,7 @@ The app is designed for quick touch-friendly troubleshooting on an Ethernet-conn
 - Download/upload speed history graph.
 - Peak high, peak low, and average variance between tests.
 - LLDP capture using `PSDiscoveryProtocol` on Windows.
+- Local subnet IP scanner with hostname lookup and common TCP port checks.
 - Branded footer and favicon.
 
 ## Screens / Data Shown
@@ -37,6 +38,7 @@ The dashboard currently includes:
 - Download, upload, and latency.
 - Speed history chart.
 - LLDP neighbor details when captured.
+- IP scanner results on a separate tab, including detected devices, hostnames, MAC addresses, and open common ports.
 
 ## Requirements
 
@@ -192,6 +194,14 @@ Installs `PSDiscoveryProtocol` for the current user.
 
 Starts an LLDP capture window.
 
+### `GET /api/ip-scan`
+
+Returns the latest IP scanner status and results.
+
+### `POST /api/ip-scan/start`
+
+Starts a local subnet scan. The scanner probes common TCP ports on the active IPv4 subnet, merges Windows ARP entries, resolves hostnames where available, and reports open ports including HTTP, HTTPS, SMB, RDP, SSH, DNS, printer, and alternate web ports.
+
 ### `POST /api/admin/restart-elevated`
 
 Triggers a Windows UAC prompt and restarts the backend elevated.
@@ -234,6 +244,7 @@ Remove or replace those before publishing if the branding should not be public.
 ## Known Limitations
 
 - LLDP capture is Windows-focused and depends on PowerShell plus elevated permissions.
+- The IP scanner scans the active local IPv4 subnet only. Larger networks are capped to the local `/24` to keep the scan responsive.
 - Speedtest results depend on remote endpoint availability and rate limits.
 - Speedtest history is stored in memory and resets when the backend restarts.
 - The backend currently prefers Ethernet-like adapters and may need refinement for unusual NIC names.

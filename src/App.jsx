@@ -6,11 +6,13 @@ import {
   Gauge,
   Globe2,
   LineChart,
+  Monitor,
   Network,
   PackagePlus,
   RefreshCw,
   Router,
   SatelliteDish,
+  Search,
   Server,
   Shield,
   ShieldAlert,
@@ -386,9 +388,108 @@ function SpeedHistoryChart({ history = [], stats, nextRunAt }) {
   );
 }
 
+function IpScanner({ scan }) {
+  const [starting, setStarting] = useState(false);
+  const running = starting || scan?.status === "running";
+  const devices = scan?.devices || [];
+  const totalHosts = scan?.totalHosts || 0;
+  const scannedHosts = scan?.scannedHosts || 0;
+  const progress = totalHosts ? Math.min(100, Math.round((scannedHosts / totalHosts) * 100)) : 0;
+
+  async function startScan() {
+    setStarting(true);
+    try {
+      await fetch(`${API_BASE}/api/ip-scan/start`, { method: "POST" });
+    } finally {
+      window.setTimeout(() => setStarting(false), 900);
+    }
+  }
+
+  return (
+    <section className="scannerPanel">
+      <div className="panelHeader">
+        <div className="sectionHeading">
+          <Search size={24} />
+          <h2>IP scanner</h2>
+        </div>
+        <button className="iconButton" type="button" onClick={startScan} disabled={running}>
+          <RefreshCw className={running ? "spin" : ""} size={20} />
+          <span>{running ? "Scanning" : "Scan network"}</span>
+        </button>
+      </div>
+
+      <div className="scannerSummary">
+        <div>
+          <span>Subnet</span>
+          <strong>{scan?.subnet || "Waiting for scan"}</strong>
+        </div>
+        <div>
+          <span>Range</span>
+          <strong>{scan?.range || "Unavailable"}</strong>
+        </div>
+        <div>
+          <span>Devices</span>
+          <strong>{devices.length}</strong>
+        </div>
+      </div>
+
+      {running ? (
+        <div className="scanProgress" aria-label="Scan progress">
+          <span style={{ width: `${progress}%` }} />
+        </div>
+      ) : null}
+
+      <div className={scan?.error ? "warning" : "inlineStatus"}>{scan?.error || scan?.message || "Run a scan to discover devices."}</div>
+
+      {devices.length ? (
+        <div className="deviceTable">
+          <div className="deviceHeader">
+            <span>Device</span>
+            <span>Address</span>
+            <span>Open ports</span>
+          </div>
+          {devices.map((device) => (
+            <div className="deviceRow" key={device.ipAddress}>
+              <div className="deviceName">
+                <Monitor size={20} />
+                <div>
+                  <strong>{device.hostname || "Unknown host"}</strong>
+                  <span>{[device.isLocalHost ? "This computer" : null, device.isGateway ? "Gateway" : null].filter(Boolean).join(" / ") || "Network device"}</span>
+                </div>
+              </div>
+              <div>
+                <strong>{device.ipAddress}</strong>
+                <span>{device.macAddress || "MAC unavailable"}</span>
+              </div>
+              <div className="portList">
+                {device.openPorts?.length ? (
+                  device.openPorts.map((entry) => (
+                    <span key={`${device.ipAddress}-${entry.port}`}>
+                      {entry.port} {entry.service}
+                    </span>
+                  ))
+                ) : (
+                  <span>No common ports open</span>
+                )}
+              </div>
+            </div>
+          ))}
+        </div>
+      ) : (
+        <div className="emptyState">
+          <ShieldAlert size={28} />
+          <span>{running ? `Scanned ${scannedHosts} of ${totalHosts || "..."} hosts.` : "No scan results yet."}</span>
+        </div>
+      )}
+    </section>
+  );
+}
+
 function App() {
   const { data: diagnostics, error } = usePolling("/api/diagnostics", 2000);
   const { data: speed } = usePolling("/api/speedtest", 1200);
+  const { data: scan } = usePolling("/api/ip-scan", 1200);
+  const [activeView, setActiveView] = useState("dashboard");
   const adapter = diagnostics?.adapter;
   const network = diagnostics?.network;
   const connected = Boolean(adapter?.cableConnected);
@@ -418,29 +519,48 @@ function App() {
         <StatusPill connected={connected} />
       </header>
 
+      <nav className="viewTabs" aria-label="Network diagnostic views">
+        <button type="button" className={activeView === "dashboard" ? "active" : ""} onClick={() => setActiveView("dashboard")}>
+          <Activity size={18} />
+          <span>Dashboard</span>
+        </button>
+        <button type="button" className={activeView === "scanner" ? "active" : ""} onClick={() => setActiveView("scanner")}>
+          <Search size={18} />
+          <span>IP scanner</span>
+        </button>
+      </nav>
+
       {error ? <div className="appError">Backend unavailable: {error}</div> : null}
 
-      <section className="heroBand">
-        <div>
-          <p>{adapter?.description || diagnostics?.host?.hostname || "Waiting for adapter data"}</p>
-          <strong>{adapter?.linkSpeed || "Link speed unavailable"}</strong>
-        </div>
-        <Activity size={64} />
-      </section>
+      {activeView === "dashboard" ? (
+        <>
+          <section className="heroBand">
+            <div>
+              <p>{adapter?.description || diagnostics?.host?.hostname || "Waiting for adapter data"}</p>
+              <strong>{adapter?.linkSpeed || "Link speed unavailable"}</strong>
+            </div>
+            <Activity size={64} />
+          </section>
 
-      <div className="dashboardGrid">
-        <Speedtest speed={speed} />
-        <div className="metricGrid">
-          <Metric icon={Server} label="DHCP lease IP" value={network?.ipAddress} hint={formatDate(network?.leaseExpires)} />
-          <Metric icon={Router} label="Gateway" value={network?.gateway} hint={network?.gatewayMac ? `MAC ${network.gatewayMac}` : "No gateway MAC"} />
-          <Metric icon={Network} label="Subnet mask" value={network?.subnetMask} hint={network?.prefixLength ? `/${network.prefixLength}` : null} />
-          <Metric icon={Cable} label="Lease source" value={network?.dhcpServer || network?.dhcpDeviceHint} hint={dhcpHint} />
-          <Metric icon={Globe2} label="Public IP" value={speed?.publicIp} hint={speed?.isp || speed?.publicInfoError || "Looking up"} />
-        </div>
-      </div>
+          <div className="dashboardGrid">
+            <Speedtest speed={speed} />
+            <div className="metricGrid">
+              <Metric icon={Server} label="DHCP lease IP" value={network?.ipAddress} hint={formatDate(network?.leaseExpires)} />
+              <Metric icon={Router} label="Gateway" value={network?.gateway} hint={network?.gatewayMac ? `MAC ${network.gatewayMac}` : "No gateway MAC"} />
+              <Metric icon={Network} label="Subnet mask" value={network?.subnetMask} hint={network?.prefixLength ? `/${network.prefixLength}` : null} />
+              <Metric icon={Cable} label="Lease source" value={network?.dhcpServer || network?.dhcpDeviceHint} hint={dhcpHint} />
+              <Metric icon={Globe2} label="Public IP" value={speed?.publicIp} hint={speed?.isp || speed?.publicInfoError || "Looking up"} />
+            </div>
+          </div>
 
-      <LldpPanel lldp={diagnostics?.lldp} />
-      <SpeedHistoryChart history={speed?.history} stats={speed?.historyStats} nextRunAt={speed?.nextRunAt} />
+          <LldpPanel lldp={diagnostics?.lldp} />
+          <SpeedHistoryChart history={speed?.history} stats={speed?.historyStats} nextRunAt={speed?.nextRunAt} />
+        </>
+      ) : (
+        <div className="scannerView">
+          <IpScanner scan={scan} />
+        </div>
+      )}
       <footer className="appFooter">
         <a href="https://bonniciwebservices.com.au" target="_blank" rel="noreferrer" aria-label="Bonnici Web Services">
           <img src="/bws-logo.svg" alt="" aria-hidden="true" />
