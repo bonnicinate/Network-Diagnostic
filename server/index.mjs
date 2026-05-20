@@ -93,6 +93,7 @@ const PORT_LABELS = {
   8443: "HTTPS alt",
   9100: "Printer",
 };
+const WEB_PORTS = new Set([80, 443, 8000, 8080, 8443]);
 
 function sendJson(res, status, body) {
   const payload = JSON.stringify(body);
@@ -553,10 +554,48 @@ function checkTcpPort(ipAddress, port, timeoutMs = 260) {
   });
 }
 
+function httpRequestStatus(url, timeoutMs = 1200) {
+  return new Promise((resolve, reject) => {
+    const target = new URL(url);
+    const client = target.protocol === "https:" ? https : http;
+    const request = client.request(
+      {
+        hostname: target.hostname,
+        port: target.port || undefined,
+        path: target.pathname,
+        method: "GET",
+        timeout: timeoutMs,
+        rejectUnauthorized: false,
+      },
+      (response) => {
+        response.resume();
+        response.on("end", () => resolve({ statusCode: response.statusCode || 0 }));
+      },
+    );
+    request.on("timeout", () => request.destroy(new Error("HTTP check timed out.")));
+    request.on("error", reject);
+    request.end();
+  });
+}
+
 async function scanOpenPorts(ipAddress) {
   const checks = await mapLimit(IP_SCAN_PORTS, 4, async (port) => {
     const open = await checkTcpPort(ipAddress, port);
-    return open ? { port, service: PORT_LABELS[port] || "TCP" } : null;
+    if (!open) return null;
+    const entry = { port, service: PORT_LABELS[port] || "TCP" };
+    if (WEB_PORTS.has(port)) {
+      const protocol = port === 443 || port === 8443 ? "https" : "http";
+      const url = `${protocol}://${ipAddress}${port === 80 || port === 443 ? "" : `:${port}`}/`;
+      try {
+        const response = await httpRequestStatus(url, 1200);
+        entry.httpStatus = response.statusCode;
+        entry.url = url;
+        entry.webAvailable = response.statusCode === 200;
+      } catch {
+        entry.webAvailable = false;
+      }
+    }
+    return entry;
   });
   return checks.filter(Boolean);
 }
@@ -565,6 +604,8 @@ function runIpScanWorker({ hosts, network }) {
   const workerScript = `
 const { parentPort, workerData } = require("node:worker_threads");
 const net = require("node:net");
+const http = require("node:http");
+const https = require("node:https");
 const dns = require("node:dns").promises;
 const { execFile } = require("node:child_process");
 const { promisify } = require("node:util");
@@ -606,10 +647,48 @@ function checkTcpPort(ipAddress, port, timeoutMs = 260) {
   });
 }
 
+function httpRequestStatus(url, timeoutMs = 1200) {
+  return new Promise((resolve, reject) => {
+    const target = new URL(url);
+    const client = target.protocol === "https:" ? https : http;
+    const request = client.request(
+      {
+        hostname: target.hostname,
+        port: target.port || undefined,
+        path: target.pathname,
+        method: "GET",
+        timeout: timeoutMs,
+        rejectUnauthorized: false,
+      },
+      (response) => {
+        response.resume();
+        response.on("end", () => resolve({ statusCode: response.statusCode || 0 }));
+      },
+    );
+    request.on("timeout", () => request.destroy(new Error("HTTP check timed out.")));
+    request.on("error", reject);
+    request.end();
+  });
+}
+
 async function scanOpenPorts(ipAddress) {
   const checks = await mapLimit(workerData.ports, 6, async (port) => {
     const open = await checkTcpPort(ipAddress, port);
-    return open ? { port, service: workerData.labels[String(port)] || "TCP" } : null;
+    if (!open) return null;
+    const entry = { port, service: workerData.labels[String(port)] || "TCP" };
+    if (workerData.webPorts.includes(port)) {
+      const protocol = port === 443 || port === 8443 ? "https" : "http";
+      const url = \`\${protocol}://\${ipAddress}\${port === 80 || port === 443 ? "" : \`:\${port}\`}/\`;
+      try {
+        const response = await httpRequestStatus(url, 1200);
+        entry.httpStatus = response.statusCode;
+        entry.url = url;
+        entry.webAvailable = response.statusCode === 200;
+      } catch {
+        entry.webAvailable = false;
+      }
+    }
+    return entry;
   });
   return checks.filter(Boolean);
 }
@@ -693,6 +772,7 @@ async function resolveHostname(ipAddress) {
         network,
         ports: IP_SCAN_PORTS,
         labels: PORT_LABELS,
+        webPorts: Array.from(WEB_PORTS),
         platform: process.platform,
       },
     });

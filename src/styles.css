@@ -455,7 +455,8 @@ h2 {
   gap: 8px;
 }
 
-.portList span {
+.portList span,
+.portLink {
   display: inline-flex;
   align-items: center;
   min-height: 30px;
@@ -464,6 +465,19 @@ h2 {
   border: 1px solid rgba(28, 83, 165, 0.58);
   border-radius: 999px;
   background: rgba(2, 8, 17, 0.68);
+}
+
+.portLink {
+  color: #b8d8ff;
+  border-color: #2b78df;
+  background: #061b36;
+  text-decoration: none;
+}
+
+.portLink:hover,
+.portLink:focus-visible {
+  color: #ffffff;
+  border-color: #39d5ff;
 }
 
 .panelHeader {

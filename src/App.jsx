@@ -463,11 +463,18 @@ function IpScanner({ scan }) {
               </div>
               <div className="portList">
                 {device.openPorts?.length ? (
-                  device.openPorts.map((entry) => (
-                    <span key={`${device.ipAddress}-${entry.port}`}>
-                      {entry.port} {entry.service}
-                    </span>
-                  ))
+                  device.openPorts.map((entry) =>
+                    entry.webAvailable && entry.url ? (
+                      <a className="portLink" key={`${device.ipAddress}-${entry.port}`} href={entry.url} target="_blank" rel="noreferrer">
+                        {entry.port} {entry.service} 200
+                      </a>
+                    ) : (
+                      <span key={`${device.ipAddress}-${entry.port}`}>
+                        {entry.port} {entry.service}
+                        {entry.httpStatus ? ` ${entry.httpStatus}` : ""}
+                      </span>
+                    ),
+                  )
                 ) : (
                   <span>No common ports open</span>
                 )}

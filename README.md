@@ -51,6 +51,14 @@ The app can run without elevation for most diagnostics. LLDP packet capture requ
 
 ## Quick Start
 
+For first-time setup, run:
+
+```text
+prep.cmd
+```
+
+It opens an elevated interactive setup shell, installs Node dependencies, builds the frontend, and installs the optional LLDP capture module. If PowerShell asks to trust NuGet or PSGallery, enter `Y`.
+
 Double-click one of the launchers:
 
 - `Launch Network Diagnostic.cmd`
@@ -200,7 +208,7 @@ Returns the latest IP scanner status and results.
 
 ### `POST /api/ip-scan/start`
 
-Starts a local subnet scan. The scanner probes common TCP ports on the active IPv4 subnet, merges Windows ARP entries, resolves hostnames where available, and reports open ports including HTTP, HTTPS, SMB, RDP, SSH, DNS, printer, and alternate web ports.
+Starts a local subnet scan. The scanner probes common TCP ports on the active IPv4 subnet, merges Windows ARP entries, resolves hostnames where available, and reports open ports including HTTP, HTTPS, SMB, RDP, SSH, DNS, printer, and alternate web ports. Web ports that return HTTP `200` include a clickable URL in the app.
 
 ### `POST /api/admin/restart-elevated`
 
